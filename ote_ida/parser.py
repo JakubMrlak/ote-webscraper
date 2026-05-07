@@ -1,7 +1,7 @@
 import pandas as pd
 import io
 import logging
-from datetime import date
+from datetime import date, timedelta
 import zoneinfo
 
 logger = logging.getLogger(__name__)
@@ -61,13 +61,27 @@ def _parse_intervals(df_raw: pd.DataFrame, session: str, delivery_date: date) ->
         "import_mwh": pd.to_numeric(data["import"].values, errors="coerce"),
     })
 
-    # Validační příznak - standardní den má 96 intervalů
-    expected = 96
+    expected = _expected_intervals(session, delivery_date)
     result["interval_count_valid"] = len(result) == expected
     if len(result) != expected:
         logger.warning(f"{session} {delivery_date}: očekáváno {expected} intervalů, nalezeno {len(result)}")
 
     return result
+
+def _expected_intervals(session: str, delivery_date: date) -> int:
+    """Vrátí očekávaný počet intervalů pro danou session a datum."""
+    tz = zoneinfo.ZoneInfo("Europe/Prague")
+
+    # IDA3 má vždy pevný rozsah 12:00-24:00 = 48 intervalů
+    if session == "IDA3":
+        return 48
+
+    # IDA1 a IDA2 pokrývají celý den - počet závisí na DST
+    day_start = pd.Timestamp(delivery_date).tz_localize(tz, nonexistent="shift_forward")
+    day_end = pd.Timestamp(delivery_date + timedelta(days=1)).tz_localize(tz, nonexistent="shift_forward")
+    hours = (day_end - day_start).total_seconds() / 3600
+
+    return int(hours * 4)  # 4 intervaly za hodinu
 
 
 def _parse_summary(df_raw: pd.DataFrame, session: str, delivery_date: date) -> pd.DataFrame:
@@ -92,7 +106,13 @@ def _parse_summary(df_raw: pd.DataFrame, session: str, delivery_date: date) -> p
 def _parse_timestamp(delivery_date: date, time_str: str) -> pd.Timestamp:
     """Převede datum a časový řetězec na timezone-aware Timestamp."""
     time_str = time_str.strip()
-    hour, minute = int(time_str[:2]), int(time_str[3:5])
+
+    # Podzimní přechod - OTE označuje opakující se hodinu jako 02a/02b
+    is_second_occurrence = "b" in time_str
+    time_str = time_str.replace("a", "").replace("b", "")
+
+    hour = int(time_str[:2])
+    minute = int(time_str[3:5])
 
     # 24:00 = půlnoc = začátek dalšího dne
     if hour == 24:
@@ -105,5 +125,6 @@ def _parse_timestamp(delivery_date: date, time_str: str) -> pd.Timestamp:
     try:
         return ts.tz_localize(TZ, nonexistent="shift_forward")
     except Exception:
-        # Podzimní přechod - ambiguous timestamp, bereme první výskyt (letní čas)
-        return ts.tz_localize(TZ, ambiguous=True, nonexistent="shift_forward")
+        # Ambiguous timestamp - podzimní přechod
+        # is_second_occurrence=True znamená zimní čas (druhý výskyt = False v pandas)
+        return ts.tz_localize(TZ, ambiguous=not is_second_occurrence, nonexistent="shift_forward")
